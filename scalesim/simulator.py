@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from multiprocessing import Pool
 
 from scalesim.scale_config import scale_config as cfg
 from scalesim.topology_utils import topologies as topo
@@ -14,6 +15,7 @@ class simulator:
         self.top_path = Path("./")
         self.verbose = True
         self.save_trace = True
+        self.parallelize = False
 
         self.num_layers = 0
 
@@ -30,6 +32,7 @@ class simulator:
         top_path="./",
         verbosity=True,
         save_trace=True,
+        parallelize=False,
     ):
 
         self.conf = config_obj
@@ -40,11 +43,28 @@ class simulator:
             self.top_path = Path(top_path)
         self.verbose = verbosity
         self.save_trace = save_trace
+        self.parallelize = parallelize
 
         # Calculate inferrable parameters here
         self.num_layers = self.topo.get_num_layers()
 
         self.params_set_flag = True
+
+    def process_layer(self, layer):
+        """
+        Run a unit of work for each layer.
+
+        Note that output will be out-of-order, so there
+        is not printing here.
+        """
+        layer.run()
+
+        if self.save_trace:
+            layer.save_traces(self.top_path)
+
+        print(f"Layer {layer.layer_id} is done")
+        # The layer object get modified.
+        return layer
 
     #
     def run(self):
@@ -57,7 +77,7 @@ class simulator:
                 layer_id=i,
                 config_obj=self.conf,
                 topology_obj=self.topo,
-                verbose=self.verbose,
+                verbose=False if self.parallelize else self.verbose,
             )
 
             self.single_layer_sim_object_list.append(this_layer_sim)
@@ -68,54 +88,62 @@ class simulator:
         self.top_path = report_path
 
         # 2. Run each layer
-        # TODO: This is parallelizable
-        for single_layer_obj in self.single_layer_sim_object_list:
-
-            if self.verbose:
-                layer_id = single_layer_obj.get_layer_id()
-                print("\nRunning Layer " + str(layer_id))
-
-            single_layer_obj.run()
-
-            if self.verbose:
-                comp_items = single_layer_obj.get_compute_report_items()
-                comp_cycles = comp_items[0]
-                stall_cycles = comp_items[1]
-                util = comp_items[2]
-                mapping_eff = comp_items[3]
-                print("Compute cycles: " + str(comp_cycles))
-                print("Stall cycles: " + str(stall_cycles))
-                print("Overall utilization: " + "{:.2f}".format(util) + "%")
-                print("Mapping efficiency: " + "{:.2f}".format(mapping_eff) + "%")
-
-                avg_bw_items = single_layer_obj.get_bandwidth_report_items()
-                avg_ifmap_bw = avg_bw_items[3]
-                avg_filter_bw = avg_bw_items[4]
-                avg_ofmap_bw = avg_bw_items[5]
-                print(
-                    "Average IFMAP DRAM BW: "
-                    + "{:.3f}".format(avg_ifmap_bw)
-                    + " words/cycle"
+        if self.parallelize:
+            with Pool() as pool:
+                result_layers = pool.map(
+                    self.process_layer, self.single_layer_sim_object_list
                 )
-                print(
-                    "Average Filter DRAM BW: "
-                    + "{:.3f}".format(avg_filter_bw)
-                    + " words/cycle"
-                )
-                print(
-                    "Average OFMAP DRAM BW: "
-                    + "{:.3f}".format(avg_ofmap_bw)
-                    + " words/cycle"
-                )
+                self.single_layer_sim_object_list = result_layers
+            print("All layers are done")
+            self.all_layer_run_done = True
+        else:
+            for single_layer_obj in self.single_layer_sim_object_list:
 
-            if self.save_trace:
                 if self.verbose:
-                    print("Saving traces: ", end="")
-                single_layer_obj.save_traces(self.top_path)
-                if self.verbose:
-                    print("Done!")
+                    layer_id = single_layer_obj.get_layer_id()
+                    print("\nRunning Layer " + str(layer_id))
 
-        self.all_layer_run_done = True
+                single_layer_obj.run()
+
+                if self.verbose:
+                    comp_items = single_layer_obj.get_compute_report_items()
+                    comp_cycles = comp_items[0]
+                    stall_cycles = comp_items[1]
+                    util = comp_items[2]
+                    mapping_eff = comp_items[3]
+                    print("Compute cycles: " + str(comp_cycles))
+                    print("Stall cycles: " + str(stall_cycles))
+                    print("Overall utilization: " + "{:.2f}".format(util) + "%")
+                    print("Mapping efficiency: " + "{:.2f}".format(mapping_eff) + "%")
+
+                    avg_bw_items = single_layer_obj.get_bandwidth_report_items()
+                    avg_ifmap_bw = avg_bw_items[3]
+                    avg_filter_bw = avg_bw_items[4]
+                    avg_ofmap_bw = avg_bw_items[5]
+                    print(
+                        "Average IFMAP DRAM BW: "
+                        + "{:.3f}".format(avg_ifmap_bw)
+                        + " words/cycle"
+                    )
+                    print(
+                        "Average Filter DRAM BW: "
+                        + "{:.3f}".format(avg_filter_bw)
+                        + " words/cycle"
+                    )
+                    print(
+                        "Average OFMAP DRAM BW: "
+                        + "{:.3f}".format(avg_ofmap_bw)
+                        + " words/cycle"
+                    )
+
+                if self.save_trace:
+                    if self.verbose:
+                        print("Saving traces: ", end="")
+                    single_layer_obj.save_traces(self.top_path)
+                    if self.verbose:
+                        print("Done!")
+
+            self.all_layer_run_done = True
 
         self.generate_reports()
 
@@ -145,8 +173,7 @@ class simulator:
         header += "DRAM OFMAP Start Cycle, DRAM OFMAP Stop Cycle, DRAM OFMAP Writes,\n"
         detail_report.write(header)
 
-        for lid in range(len(self.single_layer_sim_object_list)):
-            single_layer_obj = self.single_layer_sim_object_list[lid]
+        for lid, single_layer_obj in enumerate(self.single_layer_sim_object_list):
             compute_report_items_this_layer = (
                 single_layer_obj.get_compute_report_items()
             )
